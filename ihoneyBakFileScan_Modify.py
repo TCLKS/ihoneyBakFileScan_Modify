@@ -1,7 +1,9 @@
 # -*- coding: UTF-8 -*-
 import requests
 import logging
+import random
 import threading
+import time
 import uuid
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -22,8 +24,28 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-ua = UserAgent()
+FALLBACK_USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+]
+
+try:
+    ua = UserAgent()
+except Exception:
+    ua = None
+
 OUTPUT_LOCK = threading.Lock()
+
+
+def random_ua() -> str:
+    if ua is not None:
+        try:
+            return ua.random
+        except Exception:
+            pass
+    return random.choice(FALLBACK_USER_AGENTS)
 
 
 def build_session(max_workers: int) -> requests.Session:
@@ -40,7 +62,7 @@ def build_session(max_workers: int) -> requests.Session:
 
 def make_headers() -> Dict[str, str]:
     return {
-        'User-Agent': ua.random,
+        'User-Agent': random_ua(),
         'Accept-Encoding': 'identity'
     }
 
@@ -57,7 +79,7 @@ def normalize_header_value(value: str) -> str:
 
 def get_candidate_suffix(url: str) -> str:
     path = urlparse(url).path.lower()
-    for suffix in sorted(SUFFIX_FORMAT, key=len, reverse=True):
+    for suffix in SUFFIX_FORMAT_SORTED:
         if path.endswith(suffix):
             return suffix
     return ''
@@ -84,27 +106,29 @@ def looks_like_text_backup(suffix: str, content_type: str) -> bool:
     )
 
 
+KNOWN_MAGIC_CHECKS = {
+    '.zip': lambda data: data.startswith(b'PK\x03\x04') or data.startswith(b'PK\x05\x06') or data.startswith(b'PK\x07\x08'),
+    '.jar': lambda data: data.startswith(b'PK\x03\x04'),
+    '.war': lambda data: data.startswith(b'PK\x03\x04'),
+    '.gz': lambda data: data.startswith(b'\x1f\x8b\x08'),
+    '.sql.gz': lambda data: data.startswith(b'\x1f\x8b\x08'),
+    '.tgz': lambda data: data.startswith(b'\x1f\x8b\x08'),
+    '.tar.gz': lambda data: data.startswith(b'\x1f\x8b\x08'),
+    '.bz2': lambda data: data.startswith(b'BZh'),
+    '.tar.bz2': lambda data: data.startswith(b'BZh'),
+    '.xz': lambda data: data.startswith(b'\xfd7zXZ\x00'),
+    '.txz': lambda data: data.startswith(b'\xfd7zXZ\x00'),
+    '.tar.xz': lambda data: data.startswith(b'\xfd7zXZ\x00'),
+    '.7z': lambda data: data.startswith(b"7z\xbc\xaf'\x1c"),
+    '.rar': lambda data: data.startswith(b'Rar!\x1a\x07\x00') or data.startswith(b'Rar!\x1a\x07\x01\x00'),
+    '.sqlite': lambda data: data.startswith(b'SQLite format 3\x00'),
+    '.sqlite3': lambda data: data.startswith(b'SQLite format 3\x00'),
+    '.db': lambda data: data.startswith(b'SQLite format 3\x00'),
+}
+
+
 def has_known_magic(sample: bytes, suffix: str) -> bool:
-    checks = {
-        '.zip': lambda data: data.startswith(b'PK\x03\x04') or data.startswith(b'PK\x05\x06') or data.startswith(b'PK\x07\x08'),
-        '.jar': lambda data: data.startswith(b'PK\x03\x04'),
-        '.war': lambda data: data.startswith(b'PK\x03\x04'),
-        '.gz': lambda data: data.startswith(b'\x1f\x8b\x08'),
-        '.sql.gz': lambda data: data.startswith(b'\x1f\x8b\x08'),
-        '.tgz': lambda data: data.startswith(b'\x1f\x8b\x08'),
-        '.tar.gz': lambda data: data.startswith(b'\x1f\x8b\x08'),
-        '.bz2': lambda data: data.startswith(b'BZh'),
-        '.tar.bz2': lambda data: data.startswith(b'BZh'),
-        '.xz': lambda data: data.startswith(b'\xfd7zXZ\x00'),
-        '.txz': lambda data: data.startswith(b'\xfd7zXZ\x00'),
-        '.tar.xz': lambda data: data.startswith(b'\xfd7zXZ\x00'),
-        '.7z': lambda data: data.startswith(b"7z\xbc\xaf'\x1c"),
-        '.rar': lambda data: data.startswith(b'Rar!\x1a\x07\x00') or data.startswith(b'Rar!\x1a\x07\x01\x00'),
-        '.sqlite': lambda data: data.startswith(b'SQLite format 3\x00'),
-        '.sqlite3': lambda data: data.startswith(b'SQLite format 3\x00'),
-        '.db': lambda data: data.startswith(b'SQLite format 3\x00'),
-    }
-    checker = checks.get(suffix)
+    checker = KNOWN_MAGIC_CHECKS.get(suffix)
     return checker(sample) if checker else False
 
 
@@ -200,11 +224,14 @@ def is_site_accessible(
         return False, f"request_error: {exc}"
 
 
-def log_success(url: str, content_length: str, output_path: Path) -> None:
+def log_success(url: str, content_length: str, output_path: Path, seen: Set[str]) -> None:
     size_str = naturalsize(int(content_length), binary=True)
-    logging.warning(f"[ success ] {url}  size: {size_str}")
 
     with OUTPUT_LOCK:
+        if url in seen:
+            return
+        seen.add(url)
+        logging.warning(f"[ success ] {url}  size: {size_str}")
         with open(output_path, 'a', encoding='utf-8') as f:
             f.write(f"{url} size:{size_str}\n")
 
@@ -214,25 +241,29 @@ def get_not_found_fingerprint(
     session: requests.Session,
     connect_timeout: int,
     read_timeout: int,
-    proxies: Optional[Dict]
-) -> Optional[Dict[str, str]]:
+    proxies: Optional[Dict],
+    get_only: bool = False
+) -> Tuple[Optional[Dict[str, str]], bool]:
     marker = f"__ihoney_not_found__{uuid.uuid4().hex}.txt"
     probe_url = urljoin(base_url.rstrip('/') + '/', marker)
 
-    try:
-        head_resp = session.head(
-            probe_url,
-            headers=make_headers(),
-            timeout=(connect_timeout, read_timeout),
-            allow_redirects=False,
-            verify=False,
-            proxies=proxies
-        )
-        with head_resp:
-            if head_resp.status_code in {404, 410, 301, 302, 303, 307, 308, 200, 403}:
-                return build_response_fingerprint(head_resp)
-    except requests.RequestException:
-        pass
+    head_ok = False
+    if not get_only:
+        try:
+            head_resp = session.head(
+                probe_url,
+                headers=make_headers(),
+                timeout=(connect_timeout, read_timeout),
+                allow_redirects=False,
+                verify=False,
+                proxies=proxies
+            )
+            with head_resp:
+                if head_resp.status_code in {404, 410, 301, 302, 303, 307, 308, 200, 403}:
+                    head_ok = True
+                    return build_response_fingerprint(head_resp), head_ok
+        except requests.RequestException:
+            pass
 
     try:
         with closing(session.get(
@@ -245,9 +276,9 @@ def get_not_found_fingerprint(
             proxies=proxies
         )) as resp:
             sample = resp.raw.read(64, decode_content=False)
-            return build_response_fingerprint(resp, sample)
+            return build_response_fingerprint(resp, sample), head_ok
     except requests.RequestException:
-        return None
+        return None, head_ok
 
 
 def assess_head_response(resp: requests.Response, url: str, not_found_fingerprint: Optional[Dict[str, str]]) -> Tuple[bool, bool]:
@@ -287,24 +318,36 @@ def check_url(
     read_timeout: int,
     proxies: Optional[Dict],
     output_path: Path,
-    not_found_fingerprint: Optional[Dict[str, str]]
+    not_found_fingerprint: Optional[Dict[str, str]],
+    seen_results: Set[str],
+    skip_head: bool,
+    delay: float
 ) -> Optional[str]:
+    if delay > 0:
+        time.sleep(delay)
+
     try:
-        head_resp = session.head(
-            url,
-            headers=make_headers(),
-            timeout=(connect_timeout, read_timeout),
-            allow_redirects=False,
-            verify=False,
-            proxies=proxies
-        )
-        with head_resp:
-            is_hit, should_fallback = assess_head_response(head_resp, url, not_found_fingerprint)
-            if is_hit:
-                log_success(url, head_resp.headers['Content-Length'], output_path)
-                return None
-            if not should_fallback:
-                return None
+        if not skip_head:
+            try:
+                head_resp = session.head(
+                    url,
+                    headers=make_headers(),
+                    timeout=(connect_timeout, read_timeout),
+                    allow_redirects=False,
+                    verify=False,
+                    proxies=proxies
+                )
+                with head_resp:
+                    is_hit, should_fallback = assess_head_response(head_resp, url, not_found_fingerprint)
+                    if is_hit:
+                        log_success(url, head_resp.headers['Content-Length'], output_path, seen_results)
+                        return None
+                    if not should_fallback:
+                        return None
+            except requests.exceptions.Timeout:
+                return 'timeout'
+            except requests.RequestException:
+                pass
 
         suffix = get_candidate_suffix(url)
         with closing(session.get(
@@ -327,11 +370,12 @@ def check_url(
             if not is_likely_backup_response(resp):
                 content_type = resp.headers.get('Content-Type', '').lower()
                 if not has_download_disposition(resp) and not looks_like_text_backup(suffix, content_type):
-                    return None
+                    if suffix not in KNOWN_MAGIC_CHECKS:
+                        return None
 
             cl = resp.headers.get('Content-Length')
             if cl and int(cl) > 0 and (has_download_disposition(resp) or is_likely_backup_response(resp)):
-                log_success(url, cl, output_path)
+                log_success(url, cl, output_path, seen_results)
                 return None
 
             sample = resp.raw.read(64, decode_content=False)
@@ -343,12 +387,12 @@ def check_url(
 
             if has_known_magic(sample, suffix):
                 size_value = cl if cl and int(cl) > 0 else str(len(sample))
-                log_success(url, size_value, output_path)
+                log_success(url, size_value, output_path, seen_results)
                 return None
 
             if looks_like_text_backup(suffix, resp.headers.get('Content-Type', '').lower()) and not is_likely_text_error(sample):
                 size_value = cl if cl and int(cl) > 0 else str(len(sample))
-                log_success(url, size_value, output_path)
+                log_success(url, size_value, output_path, seen_results)
         return None
 
     except requests.exceptions.Timeout:
@@ -392,14 +436,17 @@ def generate_candidates(base_url: str, prefixes: List[str], suffixes: List[str])
     final_prefixes = variants.union(set(prefixes))
     final_prefixes = {v for v in final_prefixes if v and len(str(v)) > 0}
 
-    candidates = []
     base_path = base_url.rstrip('/') + '/'
+    candidates: Dict[str, int] = {}
     for p in final_prefixes:
+        priority = 0 if p in variants else HIGH_PRIORITY_RANK.get(p.lower(), 2)
         for suffix in suffixes:
             filename = f"{p}{suffix}" if suffix.startswith('.') else f"{p}.{suffix}"
-            candidates.append(urljoin(base_path, filename))
+            url = urljoin(base_path, filename)
+            if url not in candidates or priority < candidates[url]:
+                candidates[url] = priority
 
-    return sorted(set(candidates))
+    return [u for u, _ in sorted(candidates.items(), key=lambda item: (item[1], item[0]))]
 
 
 def scan_targets(
@@ -410,9 +457,27 @@ def scan_targets(
     max_timeouts: int,
     proxies: Optional[Dict],
     output_path: Path,
-    prefixes: List[str]
+    prefixes: List[str],
+    resume: bool = False,
+    state_path: Optional[Path] = None,
+    seen_results: Optional[Set[str]] = None,
+    no_head: bool = False,
+    delay: float = 0.0
 ) -> None:
     session = build_session(max_workers)
+    seen_results = seen_results if seen_results is not None else set()
+
+    completed: Set[str] = set()
+    if resume and state_path and state_path.exists():
+        with open(state_path, encoding='utf-8') as f:
+            completed = {line.strip() for line in f if line.strip()}
+        print(f"Resume mode: {len(completed)} target(s) already scanned, will be skipped")
+
+    def mark_done(base_url: str) -> None:
+        if state_path is None:
+            return
+        with open(state_path, 'a', encoding='utf-8') as f:
+            f.write(base_url + '\n')
 
     total_candidates = 0
     total_scanned = 0
@@ -420,12 +485,20 @@ def scan_targets(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for idx, base_url in enumerate(targets, 1):
             print(f"[{idx}/{len(targets)}] {base_url}")
+            if resume and base_url in completed:
+                print("  -> skip: already scanned (resume)")
+                continue
+
             accessible, reason = is_site_accessible(base_url, session, connect_timeout, read_timeout, proxies)
             if not accessible:
                 print(f"  -> skip: {reason}")
+                mark_done(base_url)
                 continue
 
-            not_found_fingerprint = get_not_found_fingerprint(base_url, session, connect_timeout, read_timeout, proxies)
+            not_found_fingerprint, head_ok = get_not_found_fingerprint(
+                base_url, session, connect_timeout, read_timeout, proxies, get_only=no_head
+            )
+            skip_head = no_head or not head_ok
 
             candidates = generate_candidates(base_url, prefixes, SUFFIX_FORMAT)
             site_count = len(candidates)
@@ -433,6 +506,7 @@ def scan_targets(
 
             if site_count == 0:
                 print("  -> skip: no candidates generated")
+                mark_done(base_url)
                 continue
 
             with tqdm(total=site_count, desc=f"Scanning {base_url}", unit="req", leave=False) as pbar:
@@ -458,7 +532,10 @@ def scan_targets(
                         read_timeout,
                         proxies,
                         output_path,
-                        not_found_fingerprint
+                        not_found_fingerprint,
+                        seen_results,
+                        skip_head,
+                        delay
                     )
                     in_flight.add(future)
                     return True
@@ -484,11 +561,12 @@ def scan_targets(
                                 skipped_count = sum(1 for _ in candidate_iter)
                                 if skipped_count:
                                     pbar.update(skipped_count)
-                                    total_scanned += skipped_count
                                 break
                         submit_next()
                     if site_aborted:
                         break
+
+            mark_done(base_url)
 
     print(f"Scan completed | Total candidates: {total_candidates} | Scanned: {total_scanned}")
 
@@ -503,6 +581,15 @@ SUFFIX_FORMAT = [
     '.sqlite', '.sqlite3', '.tar', '.tar.bz2', '.tar.gz', '.tar.tgz',
     '.tar.xz', '.tbz', '.tbz2', '.tgz', '.txz', '.war', '.xz', '.zip'
 ]
+
+SUFFIX_FORMAT_SORTED = sorted(SUFFIX_FORMAT, key=len, reverse=True)
+
+# Prefixes most likely to name a backup file, scanned before the rest.
+HIGH_PRIORITY_PREFIXES = [
+    'www', 'web', 'backup', 'bak', 'db', 'data', 'sql', 'database', 'dump',
+    'admin', 'wwwroot', 'root', 'test', 'index', 'home'
+]
+HIGH_PRIORITY_RANK = {name: 1 for name in HIGH_PRIORITY_PREFIXES}
 
 # 77 items
 tmp_info_dic = [
@@ -563,6 +650,9 @@ if __name__ == '__main__':
     parser.add_argument('--connect-timeout', dest='connect_timeout', type=int, default=3, help="TCP connect timeout in seconds (default: 3)")
     parser.add_argument('--read-timeout', dest='read_timeout', type=int, default=10, help="Response header/read timeout in seconds (default: 10)")
     parser.add_argument('--max-timeouts', dest='max_timeouts', type=int, default=10, help="Skip a site after this many candidate timeouts (default: 10)")
+    parser.add_argument('--no-head', dest='no_head', action='store_true', help="Skip the HEAD pre-check and use GET requests only")
+    parser.add_argument('--delay', dest='delay', type=float, default=0.0, help="Delay in seconds before each candidate request (default: 0)")
+    parser.add_argument('--resume', dest='resume', action='store_true', help="Skip targets already recorded as completed in the state file")
 
     args = parser.parse_args()
 
@@ -572,6 +662,19 @@ if __name__ == '__main__':
     output_path = Path(args.output_file) if args.output_file else Path('result.txt')
     # Ensure file exists
     output_path.touch(exist_ok=True)
+
+    state_path = Path(str(output_path) + '.state')
+
+    seen_results: Set[str] = set()
+    if output_path.exists():
+        try:
+            with open(output_path, encoding='utf-8') as f:
+                for line in f:
+                    url = line.strip().rsplit(' size:', 1)[0]
+                    if url:
+                        seen_results.add(url)
+        except Exception:
+            pass
 
     proxies = None
     if args.proxy:
@@ -609,6 +712,8 @@ if __name__ == '__main__':
         parser.error("--read-timeout must be greater than 0")
     if args.max_timeouts < 1:
         parser.error("--max-timeouts must be greater than 0")
+    if args.delay < 0:
+        parser.error("--delay must be >= 0")
 
     connect_timeout = args.connect_timeout
     read_timeout = args.read_timeout
@@ -621,5 +726,10 @@ if __name__ == '__main__':
         args.max_timeouts,
         proxies,
         output_path,
-        active_prefixes
+        active_prefixes,
+        resume=args.resume,
+        state_path=state_path,
+        seen_results=seen_results,
+        no_head=args.no_head,
+        delay=args.delay
     )

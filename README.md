@@ -66,6 +66,18 @@ https://www.baidu.com → ['www.baidu.com', 'wwwbaiducom', 'www_baidu_com', 'bai
 
 130 条扩展（已注释掉，可手动切换，包含中文如 '数据库备份'）：tmp_info_dic = ['0','00','000','数据库备份',...]
 
+## 新增特性
+
+断点续扫（--resume）：每完成一个站点即写入状态文件（结果文件名 + .state），中断后重新执行可跳过已完成站点；结果文件在启动时自动加载去重，重复命中不会重复写入。
+
+HEAD 预检优化（--no-head）：默认先 HEAD 再 GET 判定；探测到站点不支持 HEAD 时自动切换为纯 GET 模式，也可通过 --no-head 全程纯 GET。
+
+魔数兜底检测：部分服务器把 .zip/.tar.gz/.db 等以 text/plain 返回，现通过读取前 64 字节魔数（PK/gzip/SQLite 等）兜底判定，无魔数规则的后缀判定不变。
+
+候选优先级：域名变体最优先，其次高频前缀（www/web/backup/bak/db/data/sql/database/dump/admin/wwwroot/root/test/index/home），命中结果更早暴露。
+
+--delay 限速：每个候选请求前可设置延迟秒数，控制扫描强度。
+
 
 # 2. 使用方式
 
@@ -80,6 +92,9 @@ https://www.baidu.com → ['www.baidu.com', 'wwwbaiducom', 'www_baidu_com', 'bai
   -d, --dict-file       自定义文件名字典文件（追加到默认字典）
   -o, --output-file     输出结果文件（默认 result.txt）
   -p, --proxy           代理（如 socks5://127.0.0.1:1080 或 socks5h://user:pass@host:port）
+  --no-head             跳过 HEAD 预检，候选全部使用 GET 请求（更快，流量更大）
+  --delay               每个候选请求前的延迟秒数（默认 0）
+  --resume              断点续扫：跳过状态文件中已完成的站点
 
 # 批量扫描
 python3 ihoneyBakFileScan_Modify.py -t 150 -f targets.txt -o leaks.txt
@@ -89,10 +104,18 @@ python3 ihoneyBakFileScan_Modify.py -t 100 --connect-timeout 3 --read-timeout 10
 
 # 单站点 + 代理 + 自定义字典
 python3 ihoneyBakFileScan_Modify.py -u https://target.com -t 100 -p socks5h://127.0.0.1:1080 -d mydict.txt -o result.txt
+
+# 纯 GET 模式（不支持 HEAD 的站点会自动切换为纯 GET，也可手动强制）
+python3 ihoneyBakFileScan_Modify.py -u https://target.com -t 100 --no-head -o result.txt
+
+# 断点续扫（中断后重新执行，已完成站点自动跳过，结果自动去重）
+python3 ihoneyBakFileScan_Modify.py -t 150 -f targets.txt -o result.txt --resume
 ```
 
 
 # 3. 更新历史
+
+2026：新增断点续扫（--resume）、--no-head 纯 GET 模式、--delay 限速、魔数兜底检测、候选优先级排序
 
 2026：fake-useragent\humanize\tqdm by Grok
 
