@@ -7,14 +7,19 @@ import time
 import uuid
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from contextlib import closing
+from contextlib import closing, ExitStack
 from urllib.parse import urljoin, urlparse
 from fake_useragent import UserAgent
 from humanize import naturalsize
 from tqdm import tqdm
 from pathlib import Path
-from typing import List, Optional, Dict, Set, Tuple
+from typing import List, Optional, Dict, Set, Tuple, TextIO
 from requests.adapters import HTTPAdapter
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on Windows
+    resource = None
 
 requests.packages.urllib3.disable_warnings()
 
@@ -37,6 +42,9 @@ except Exception:
     ua = None
 
 OUTPUT_LOCK = threading.Lock()
+MAX_NETWORK_WORKERS = 4096
+FD_RESERVE = 256
+HIGH_CONCURRENCY_STACK_SIZE = 1024 * 1024
 
 
 def random_ua() -> str:
@@ -48,13 +56,74 @@ def random_ua() -> str:
     return random.choice(FALLBACK_USER_AGENTS)
 
 
+def get_safe_worker_count(requested_workers: int) -> int:
+    """Bound concurrent sockets/threads to a safe value for this process."""
+    safe_workers = min(requested_workers, MAX_NETWORK_WORKERS)
+
+    if resource is not None:
+        try:
+            soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+            # One active HTTPS request normally consumes one socket. Use a 2x
+            # allowance plus a reserve for DNS, files, pipes and interpreter FDs.
+            desired_limit = safe_workers * 2 + FD_RESERVE
+            if soft_limit != resource.RLIM_INFINITY and soft_limit < desired_limit:
+                new_soft_limit = desired_limit
+                if hard_limit != resource.RLIM_INFINITY:
+                    new_soft_limit = min(new_soft_limit, hard_limit)
+                if new_soft_limit > soft_limit:
+                    try:
+                        resource.setrlimit(
+                            resource.RLIMIT_NOFILE,
+                            (new_soft_limit, hard_limit),
+                        )
+                        soft_limit = new_soft_limit
+                        print(f"Raised process nofile soft limit to {soft_limit}.")
+                    except (OSError, ValueError, PermissionError):
+                        pass
+
+            if soft_limit != resource.RLIM_INFINITY:
+                # Keep descriptors available for DNS, logs, stdout and Python.
+                fd_workers = max(1, (soft_limit - FD_RESERVE) // 2)
+                safe_workers = min(safe_workers, fd_workers)
+        except (OSError, ValueError):
+            pass
+
+    safe_workers = max(1, safe_workers)
+    if safe_workers != requested_workers:
+        print(
+            f"Requested {requested_workers} threads; using {safe_workers} concurrent "
+            "network workers to avoid exhausting file descriptors."
+        )
+    return safe_workers
+
+
+def configure_thread_stack(worker_count: int) -> None:
+    """Reduce virtual memory reserved by each newly created worker thread."""
+    if worker_count < 256:
+        return
+    try:
+        threading.stack_size(HIGH_CONCURRENCY_STACK_SIZE)
+        print(
+            f"Worker thread stack size set to "
+            f"{HIGH_CONCURRENCY_STACK_SIZE // 1024} KiB."
+        )
+    except (RuntimeError, ValueError):
+        logging.warning("Unable to reduce worker thread stack size on this platform")
+
+
 def build_session(max_workers: int) -> requests.Session:
     session = requests.Session()
     session.verify = False
 
     pool_size = max(50, max_workers)
     # Disable retries for large-scale scans to avoid timeout amplification.
-    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=0)
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=0,
+        pool_block=True,
+    )
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
@@ -224,7 +293,7 @@ def is_site_accessible(
         return False, f"request_error: {exc}"
 
 
-def log_success(url: str, content_length: str, output_path: Path, seen: Set[str]) -> None:
+def log_success(url: str, content_length: str, output_file: TextIO, seen: Set[str]) -> None:
     size_str = naturalsize(int(content_length), binary=True)
 
     with OUTPUT_LOCK:
@@ -232,8 +301,8 @@ def log_success(url: str, content_length: str, output_path: Path, seen: Set[str]
             return
         seen.add(url)
         logging.warning(f"[ success ] {url}  size: {size_str}")
-        with open(output_path, 'a', encoding='utf-8') as f:
-            f.write(f"{url} size:{size_str}\n")
+        output_file.write(f"{url} size:{size_str}\n")
+        output_file.flush()
 
 
 def get_not_found_fingerprint(
@@ -317,7 +386,7 @@ def check_url(
     connect_timeout: int,
     read_timeout: int,
     proxies: Optional[Dict],
-    output_path: Path,
+    output_file: TextIO,
     not_found_fingerprint: Optional[Dict[str, str]],
     seen_results: Set[str],
     skip_head: bool,
@@ -340,7 +409,7 @@ def check_url(
                 with head_resp:
                     is_hit, should_fallback = assess_head_response(head_resp, url, not_found_fingerprint)
                     if is_hit:
-                        log_success(url, head_resp.headers['Content-Length'], output_path, seen_results)
+                        log_success(url, head_resp.headers['Content-Length'], output_file, seen_results)
                         return None
                     if not should_fallback:
                         return None
@@ -375,7 +444,7 @@ def check_url(
 
             cl = resp.headers.get('Content-Length')
             if cl and int(cl) > 0 and (has_download_disposition(resp) or is_likely_backup_response(resp)):
-                log_success(url, cl, output_path, seen_results)
+                log_success(url, cl, output_file, seen_results)
                 return None
 
             sample = resp.raw.read(64, decode_content=False)
@@ -387,12 +456,12 @@ def check_url(
 
             if has_known_magic(sample, suffix):
                 size_value = cl if cl and int(cl) > 0 else str(len(sample))
-                log_success(url, size_value, output_path, seen_results)
+                log_success(url, size_value, output_file, seen_results)
                 return None
 
             if looks_like_text_backup(suffix, resp.headers.get('Content-Type', '').lower()) and not is_likely_text_error(sample):
                 size_value = cl if cl and int(cl) > 0 else str(len(sample))
-                log_success(url, size_value, output_path, seen_results)
+                log_success(url, size_value, output_file, seen_results)
         return None
 
     except requests.exceptions.Timeout:
@@ -464,7 +533,8 @@ def scan_targets(
     no_head: bool = False,
     delay: float = 0.0
 ) -> None:
-    session = build_session(max_workers)
+    safe_workers = get_safe_worker_count(max_workers)
+    configure_thread_stack(safe_workers)
     seen_results = seen_results if seen_results is not None else set()
 
     completed: Set[str] = set()
@@ -473,100 +543,125 @@ def scan_targets(
             completed = {line.strip() for line in f if line.strip()}
         print(f"Resume mode: {len(completed)} target(s) already scanned, will be skipped")
 
-    def mark_done(base_url: str) -> None:
-        if state_path is None:
-            return
-        with open(state_path, 'a', encoding='utf-8') as f:
-            f.write(base_url + '\n')
-
     total_candidates = 0
     total_scanned = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for idx, base_url in enumerate(targets, 1):
-            print(f"[{idx}/{len(targets)}] {base_url}")
-            if resume and base_url in completed:
-                print("  -> skip: already scanned (resume)")
-                continue
-
-            accessible, reason = is_site_accessible(base_url, session, connect_timeout, read_timeout, proxies)
-            if not accessible:
-                print(f"  -> skip: {reason}")
-                mark_done(base_url)
-                continue
-
-            not_found_fingerprint, head_ok = get_not_found_fingerprint(
-                base_url, session, connect_timeout, read_timeout, proxies, get_only=no_head
+    # Open output/state files before starting network work. Keeping these handles
+    # open avoids repeatedly asking the OS for a new descriptor at peak load.
+    with ExitStack() as stack:
+        session = stack.enter_context(build_session(safe_workers))
+        output_file = stack.enter_context(
+            open(output_path, 'a', encoding='utf-8', buffering=1)
+        )
+        state_file = None
+        if state_path is not None:
+            state_file = stack.enter_context(
+                open(state_path, 'a', encoding='utf-8', buffering=1)
             )
-            skip_head = no_head or not head_ok
 
-            candidates = generate_candidates(base_url, prefixes, SUFFIX_FORMAT)
-            site_count = len(candidates)
-            total_candidates += site_count
+        def mark_done(base_url: str) -> None:
+            if state_file is None:
+                return
+            with OUTPUT_LOCK:
+                state_file.write(base_url + '\n')
+                state_file.flush()
 
-            if site_count == 0:
-                print("  -> skip: no candidates generated")
+        with ThreadPoolExecutor(max_workers=safe_workers) as executor:
+            for idx, base_url in enumerate(targets, 1):
+                print(f"[{idx}/{len(targets)}] {base_url}")
+                if resume and base_url in completed:
+                    print("  -> skip: already scanned (resume)")
+                    continue
+
+                accessible, reason = is_site_accessible(base_url, session, connect_timeout, read_timeout, proxies)
+                if not accessible:
+                    print(f"  -> skip: {reason}")
+                    mark_done(base_url)
+                    continue
+
+                not_found_fingerprint, head_ok = get_not_found_fingerprint(
+                    base_url, session, connect_timeout, read_timeout, proxies, get_only=no_head
+                )
+                skip_head = no_head or not head_ok
+
+                candidates = generate_candidates(base_url, prefixes, SUFFIX_FORMAT)
+                site_count = len(candidates)
+                total_candidates += site_count
+
+                if site_count == 0:
+                    print("  -> skip: no candidates generated")
+                    mark_done(base_url)
+                    continue
+
+                with tqdm(total=site_count, desc=f"Scanning {base_url}", unit="req", leave=False) as pbar:
+                    max_in_flight = min(safe_workers, site_count)
+                    candidate_iter = iter(candidates)
+                    in_flight = set()
+                    timeout_count = 0
+                    site_aborted = False
+
+                    def submit_next() -> bool:
+                        if site_aborted:
+                            return False
+                        try:
+                            candidate = next(candidate_iter)
+                        except StopIteration:
+                            return False
+
+                        future = executor.submit(
+                            check_url,
+                            candidate,
+                            session,
+                            connect_timeout,
+                            read_timeout,
+                            proxies,
+                            output_file,
+                            not_found_fingerprint,
+                            seen_results,
+                            skip_head,
+                            delay
+                        )
+                        in_flight.add(future)
+                        return True
+
+                    for _ in range(max_in_flight):
+                        if not submit_next():
+                            break
+
+                    while in_flight:
+                        done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            result = future.result()
+                            pbar.update(1)
+                            total_scanned += 1
+                            if result == 'timeout':
+                                timeout_count += 1
+                                if timeout_count > max_timeouts:
+                                    site_aborted = True
+                                    print(f"  -> skip: too many timeouts ({timeout_count}>{max_timeouts})")
+                                    for pending in in_flight:
+                                        pending.cancel()
+
+                                    # cancel() cannot stop requests that are already
+                                    # running. Wait for them here so they cannot pile
+                                    # up behind work submitted for the next target.
+                                    if in_flight:
+                                        wait(in_flight)
+                                        for pending in in_flight:
+                                            if not pending.cancelled():
+                                                pending.result()
+                                        in_flight.clear()
+
+                                    # Finish the visual progress bar without issuing
+                                    # any more requests for this target.
+                                    pbar.update(site_count - pbar.n)
+                                    break
+                            if not site_aborted:
+                                submit_next()
+                        if site_aborted:
+                            break
+
                 mark_done(base_url)
-                continue
-
-            with tqdm(total=site_count, desc=f"Scanning {base_url}", unit="req", leave=False) as pbar:
-                max_in_flight = max(max_workers, min(max_workers * 2, 200))
-                candidate_iter = iter(candidates)
-                in_flight = set()
-                timeout_count = 0
-                site_aborted = False
-
-                def submit_next() -> bool:
-                    if site_aborted:
-                        return False
-                    try:
-                        candidate = next(candidate_iter)
-                    except StopIteration:
-                        return False
-
-                    future = executor.submit(
-                        check_url,
-                        candidate,
-                        session,
-                        connect_timeout,
-                        read_timeout,
-                        proxies,
-                        output_path,
-                        not_found_fingerprint,
-                        seen_results,
-                        skip_head,
-                        delay
-                    )
-                    in_flight.add(future)
-                    return True
-
-                for _ in range(min(max_in_flight, site_count)):
-                    if not submit_next():
-                        break
-
-                while in_flight:
-                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        result = future.result()
-                        pbar.update(1)
-                        total_scanned += 1
-                        if result == 'timeout':
-                            timeout_count += 1
-                            if timeout_count > max_timeouts:
-                                site_aborted = True
-                                print(f"  -> skip: too many timeouts ({timeout_count}>{max_timeouts})")
-                                for pending in in_flight:
-                                    pending.cancel()
-                                in_flight.clear()
-                                skipped_count = sum(1 for _ in candidate_iter)
-                                if skipped_count:
-                                    pbar.update(skipped_count)
-                                break
-                        submit_next()
-                    if site_aborted:
-                        break
-
-            mark_done(base_url)
 
     print(f"Scan completed | Total candidates: {total_candidates} | Scanned: {total_scanned}")
 
